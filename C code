@@ -1,0 +1,729 @@
+//----------------------------------------------
+//Author: jyun teng huang
+//----------------------------------------------
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+//----------------------------------------------
+//Parameter
+//----------------------------------------------
+#define N				(int) 1024
+#define K				(int) 512
+#define code_rate		(int) (K/N)
+#define pattern			(int) 1000000
+#define iteration		(int) 60
+#define pcn				(int) 10 //log2(N), stage
+#define snr_num			(int) 1
+float EbN0db[snr_num] = { 5 };
+#define Ec				(int) 1 //Ec = (K / N)*N0 * EbN0;
+#define N0				(int) 2
+#define M_PI			(long double) acos(-1)
+#define PSthre			(double) 4.5
+
+//----------------------------------------------
+//Function algorithm
+//#0(MinSumAlgorithm), #1(Original BP)
+//----------------------------------------------
+int origin_BP = 0;
+
+//----------------------------------------------
+//Decoder algorithm
+//#0(Oneway), #1(Roundtrip)
+//#0(unidirection), #1(bidirection), for Roundtrip
+//----------------------------------------------
+int decoder_algorithm = 1;
+int direction = 0; //for Roundtrip
+
+//----------------------------------------------
+//Stopping criteria
+//#0(G-Matrix), #1(MinLLR), #2(No Stopping), #3(Stage Stopping)
+//----------------------------------------------
+int SBP_stop = 3;
+float beta = 3.5; //method 1 parameter
+
+long double AWGN(long double sigma);
+void pcc(int lookup[]);
+void pencode(int D[], int m[], int u[], int x[]);
+void pdecode(int FZlookup[], long double y[], int u_out_hd[], int itr_snr[], int LS0[], int LS1[], int LS2[], int LS3[], int LS4[], int LS5[], int LS6[], int LS7[], int LS8[], int LS9[], int LS10[]);
+bool bpstop(long double u_out[], int u_out_hd[], int x_out_hd[]);
+long double fun(long double x, long double y);
+
+int main()
+{
+	float itr_average;
+	int itr_snr[1];
+	int FZlookup[N] = { 0 };
+	int ber, fer;		//bit/frame error number
+	int m[K];			//information
+	int u[N];			//message
+	int x[N];			//codeword
+	long double y[N];	//BPSK, AWGN後的codeword
+	long double berr;	//bit-error-rate
+	int ber_pat;		//每個pattern的ber, to calculate ferr
+	long double ferr;	//frame-error-rate
+	long double EbN0;	//SNR, related to siama
+	float sigma;
+	int u1[N];			//codeword, after decoder
+	int LS0[1],LS1[1], LS2[1], LS3[1], LS4[1], LS5[1], LS6[1], LS7[1], LS8[1], LS9[1], LS10[1];	//SS計算stopping rate
+	char file_name[120];
+	char F_name[120];
+	char D_name[120];
+	char Dic_name[120];
+	char S_name[120];
+
+	if (origin_BP == 0)		//float Origin-BP m/16
+		sprintf_s(F_name, "MS");
+	else if (origin_BP == 1)
+		sprintf_s(F_name, "Or");
+
+	if (SBP_stop == 0)
+		sprintf_s(S_name, "GM");
+	else if (SBP_stop == 1)
+		sprintf_s(S_name, "MinLLR_thre=%.1f",beta);
+	else if (SBP_stop == 2)
+		sprintf_s(S_name, "NoStop");
+	else
+		sprintf_s(S_name, "SS_thre=%.1f",PSthre);
+
+	if (decoder_algorithm == 0)
+	{
+		sprintf_s(D_name, "OneWay");
+		sprintf_s(file_name, "%s_%s_%s.txt",F_name, D_name, S_name);
+	}
+	else if (decoder_algorithm == 1)
+	{
+		sprintf_s(D_name, "RoundTrip");
+		if (direction == 0)
+			sprintf_s(Dic_name, "uni");
+		else
+			sprintf_s(Dic_name, "bi");
+		sprintf_s(file_name, "%s_%s%s_%s.txt", F_name, Dic_name, D_name, S_name);
+	}
+
+	//開檔，儲存BER，SNR，FER
+	FILE *fp1;
+	fopen_s(&fp1, file_name, "w");
+
+	//檔案標題
+	fprintf(fp1, "====  [K=%4d, N=%5d, Patterns=%7d, Iteration=%4d]  ====\n\n", K, N, pattern, iteration);
+
+	//5G架構frozen bit
+	pcc(FZlookup);
+
+	for (int g = 0; g < snr_num; g++) //SNR值
+	{
+		//初始化
+		itr_snr[0] = 0;
+		LS0[0]=0,LS1[0] = 0, LS2[0] = 0, LS3[0] = 0, LS4[0] = 0, LS5[0] = 0, LS6[0] = 0, LS7[0] = 0, LS8[0] = 0, LS9[0] = 0, LS10[0] = 0;
+		ber = 0, fer = 0;
+		EbN0 = (float)(pow(10, EbN0db[g] / 10.0)); //SNR(db)=10log(10,(SNR^2)) 
+		sigma = (float)(1 / sqrt(EbN0)); //for awgn
+		//Ec = (K / N)*N0 * EbN0;?
+
+		for (int p = 1; p <= pattern; p++) //pattern數
+		{
+			//K = message,固定初始化message
+			for (int j = 0; j <= K - 1; j++)
+				m[j] = rand() % 2;
+
+			pencode(FZlookup, m, u, x);//encode, creat x
+
+			//BPSK+AWGN, creat y
+			for (int l = 0; l <= N - 1; l++)
+				y[l] = (2 * x[l] - 1) + AWGN(sigma);
+
+			pdecode(FZlookup, y, u1, itr_snr,LS0, LS1, LS2, LS3, LS4, LS5, LS6, LS7, LS8, LS9, LS10);//decoder, get u1
+
+			ber_pat = 0;
+			//計算bit-error
+			for (int i = 0; i < N; i++) {
+				if (u[i] != u1[i]) {
+					if (FZlookup[i] == 0)
+						system("pause");
+					ber++;
+					ber_pat++;
+				}
+			}
+
+			//每1000比pattern輸出1次，確保不是當機
+			if (p % 100 == 0) {
+				printf("%.2f: %d\n", EbN0db[g], p);
+			}
+
+			//計算frame-error
+			if (ber_pat > 0) {
+				fer++;
+			}
+
+		}
+
+		berr = (long double)ber / (N * pattern); //計算bit-error-rate
+		ferr = (long double)fer / pattern; //計算frame-error-rate
+		itr_average = (float)itr_snr[0]/pattern; //計算平均iteration
+		//紀錄SNR，berr，ferr
+		fprintf(fp1, "Eb/N0(dB)=%.2f: berr = %.10f  ber = %d ferr = %.10f  fer = %d averageitr = %.2f\n", EbN0db[g], berr, ber, ferr, fer, itr_average);
+		if (SBP_stop == 3)
+			fprintf(fp1, "ss:all_LS0=%.1f,LS0=%d,LS1=%d,LS2=%d,LS3=%d,LS4=%d,LS5=%d,LS6=%d,LS7=%d,LS8=%d,LS9=%d,LS10=%d\n\n", float(2*LS0[0]+LS1[0]+ LS2[0]+ LS3[0]+ LS4[0]+ LS5[0]+ LS6[0]+ LS7[0]+ LS8[0]+ LS9[0]+ 2*LS10[0])/2, LS0[0], LS1[0], LS2[0], LS3[0], LS4[0], LS5[0], LS6[0], LS7[0], LS8[0], LS9[0], LS10[0]);
+	}
+
+	fclose(fp1);
+
+	system("pause");
+	return 0;
+}
+long double AWGN(long double sigma) // box-muller method AWGM
+{
+	long double rand_r, rand_u;
+
+	rand_r = (long double)(rand() + 1) / (RAND_MAX + 1);
+	rand_u = (long double)(rand() + 1) / (RAND_MAX + 1);
+
+	return sigma * sqrt(-2 * log(rand_u)) * cos(2 * M_PI*rand_r);
+}
+void pcc(int lookup[])
+{
+	int w;
+	//5G Matrix
+	int reliability[1024] = { 0,1,2,4,8,16,32,3,5,64,9,6,17,10,18,128,12,33,65,20,256,34,24,36,7,129,66,512,11,40,68,130,19,13,48,14,72,257,21,132,35,258,26,513,80,37,25,22,136,260,264,38,514,96,67,41,144,28,69,42,516,49,74,272,160,520,288,528,192,544,70,44,131,81,50,73,15,320,133,52,23,134,384,76,137,82,56,27,97,39,259,84,138,145,261,29,43,98,515,88,140,30,146,71,262,265,161,576,45,100,640,51,148,46,75,266,273,517,104,162,53,193,152,77,164,768,268,274,
+							518,54,83,57,521,112,135,78,289,194,85,276,522,58,168,139,99,86,60,280,89,290,529,524,196,141,101,147,176,142,530,321,31,200,90,545,292,322,532,263,149,102,105,304,296,163,92,47,267,385,546,324,208,386,150,153,165,106,55,328,536,577,548,113,154,79,269,108,578,224,166,519,552,195,270,641,523,275,580,291,59,169,560,114,277,156,87,197,116,170,61,531,525,642,281,278,526,177,293,388,91,584,769,198,172,120,201,336,62,282,143,103,178,294,93,644,202,592,323,392,297,770,107,180,151,209,284,648,
+							94,204,298,400,608,352,325,533,155,210,305,547,300,109,184,534,537,115,167,225,326,306,772,157,656,329,110,117,212,171,776,330,226,549,538,387,308,216,416,271,279,158,337,550,672,118,332,579,540,389,173,121,553,199,784,179,228,338,312,704,390,174,554,581,393,283,122,448,353,561,203,63,340,394,527,582,556,181,295,285,232,124,205,182,643,562,286,585,299,354,211,401,185,396,344,586,645,593,535,240,206,95,327,564,800,402,356,307,301,417,213,568,832,588,186,646,404,227,896,594,418,302,649,771,360,539,111,331,
+							214,309,188,449,217,408,609,596,551,650,229,159,420,310,541,773,610,657,333,119,600,339,218,368,652,230,391,313,450,542,334,233,555,774,175,123,658,612,341,777,220,314,424,395,673,583,355,287,183,234,125,557,660,616,342,316,241,778,563,345,452,397,403,207,674,558,785,432,357,187,236,664,624,587,780,705,126,242,565,398,346,456,358,405,303,569,244,595,189,566,676,361,706,589,215,786,647,348,419,406,464,680,801,362,590,409,570,788,597,572,219,311,708,598,601,651,421,792,802,611,602,410,231,688,653,248,369,190,
+							364,654,659,335,480,315,221,370,613,422,425,451,614,543,235,412,343,372,775,317,222,426,453,237,559,833,804,712,834,661,808,779,617,604,433,720,816,836,347,897,234,662,454,318,675,618,898,781,376,428,665,736,567,840,625,238,359,457,399,787,591,678,434,677,349,245,458,666,620,363,127,191,782,407,436,626,571,465,681,246,707,350,599,668,790,460,249,682,573,411,803,789,709,365,440,628,689,374,423,466,793,250,371,481,574,413,603,366,468,655,900,805,615,684,710,429,794,252,373,605,848,690,713,632,482,806,427,904,
+							414,223,663,692,835,619,472,455,796,809,714,721,837,716,864,810,606,912,722,696,377,435,817,319,621,812,484,430,838,667,488,239,378,459,622,627,437,380,818,461,496,669,679,724,841,629,351,467,438,737,251,462,442,441,469,247,683,842,738,899,670,783,849,820,728,928,791,367,901,630,685,844,633,711,253,691,824,902,686,740,850,375,444,470,483,415,485,905,795,473,634,744,852,960,865,693,797,906,715,807,474,636,694,254,717,575,913,798,811,379,697,431,607,489,866,723,486,908,718,813,476,856,839,725,698,914,752,868,
+							819,814,439,929,490,623,671,739,916,463,843,381,497,930,821,726,961,872,492,631,729,700,443,741,845,920,382,822,851,730,498,880,742,445,471,635,932,687,903,825,500,846,745,826,732,446,962,936,475,853,867,637,907,487,695,746,828,753,854,857,504,799,255,964,909,719,477,915,638,748,944,869,491,699,754,858,478,968,383,910,815,976,870,917,727,493,873,701,931,756,860,499,731,823,922,874,918,502,933,743,760,881,494,702,921,501,876,847,992,447,733,827,934,882,937,963,747,505,855,924,734,829,965,938,884,506,749,945,
+							966,755,859,940,830,911,871,639,888,479,946,750,969,508,861,757,970,919,875,862,758,948,977,923,972,761,877,952,495,703,935,978,883,762,503,925,878,735,993,885,939,994,980,926,764,941,967,886,831,947,507,889,984,751,942,996,971,890,509,949,973,1000,892,950,863,759,1008,510,979,953,763,974,954,879,981,982,927,995,765,956,887,985,997,986,943,891,998,766,511,988,1001,951,1002,893,975,894,1009,955,1004,1010,957,983,958,987,1012,999,1016,767,989,1003,990,1005,959,1011,1013,895,1006,1014,1017,1018,991,1020,1007,1015,1019,1021,1022,1023 };
+
+
+	//int reliability[16] = { 0,1 , 2, 4, 8 , 3 ,5 , 9 , 6, 10, 12 , 7 ,11, 13, 14 ,15 };
+	for (int j = N-1; j >= N - K; j--)
+	{
+		w = reliability[j];
+		lookup[w] = -1;
+	}
+}
+void pencode(int D[], int m[], int u[], int x[])
+{
+	int i = 0;
+	int  b, nb, base, down;
+	int X[N];
+
+	for (int q = 0; q <= N - 1; q++)
+	{
+		if (D[q] == -1)
+		{
+			X[q] = m[i];
+			i++;
+		}
+		else
+			X[q] = 0;
+	}
+
+	for (int q = 0; q <= N - 1; q++)
+		u[q] = X[q];
+
+	for (int i = 1; i <= pcn; i++)
+	{
+		b = (int)pow(2, pcn - i + 1);
+		nb = (int)pow(2, i - 1);
+		for (int j = 1; j <= nb; j++)
+		{
+			base = (j - 1)*b;
+			down = (b / 2);
+			for (int next = 0; next <= down - 1; next++)
+			{
+				//做xor
+				X[base + next] = (X[base + next] + X[base + next + down]) % 2;
+			}
+		}
+	}
+
+
+	for (int k = 0; k <= N - 1; k++)
+	{
+		x[k] = X[k];
+	}
+}
+void pdecode(int FZlookup[], long double y[], int u_out_hd[], int itr_snr[],int LS0[], int LS1[], int LS2[], int LS3[], int LS4[], int LS5[], int LS6[], int LS7[], int LS8[], int LS9[], int LS10[])
+{
+	int st, xor0, itr, yu = 0;
+	long double dhat[N] = { 0 };
+	long double finallrs[N] = { 0 };
+	long double u_out[N];
+	long double x_out[N];
+	int x_out_hd[N];
+
+	long double L1, R1, L2, R2, LR2, domain1 = 0, domain2 = 0, domain3 = 0;
+	long double LLR[N][pcn + 1] = { 0 };
+	long double LLRR[N][pcn + 1] = { 0 };
+
+	long double LLRT[N][pcn + 1] = { 0 };
+	long double RfinalLLR[N] = { 0 };
+
+	long double u_sum, u_sum1;
+	int count, count1;
+	int column[pcn + 1];
+	for (int i = 0; i < pcn + 1; i++)
+	{
+		column[i] = 0;
+	}
+
+	//通道初始化
+	for (int i = 0; i <= N - 1; i++)
+		LLR[i][pcn] = -(4 * sqrt(Ec) / N0)*y[i];
+
+	//設frozen bit
+	for (int i = 0; i <= N - 1; i++) {
+
+		if (FZlookup[i] == -1) {
+			LLRR[i][0] = 0;
+		}
+		else {
+			LLRR[i][0] = 1000000;
+		}
+	}
+
+	/*看輸出
+	char file_name[120];
+	FILE *fp2;
+	fopen_s(&fp2, "initial_R.txt", "w");
+	fprintf(fp2, "u=\n");
+	for (int i = 0; i < N; i++)
+	{
+		for (int j = 0; j < pcn + 1; j++)
+		{
+			fprintf(fp2, "%12.3f ", (float)LLRR[i][j]);
+		}
+		fprintf(fp2, "\n");
+	}
+	fclose(fp2);
+	FILE *fp1;
+	fopen_s(&fp1, "initial_L.txt", "w");
+	fprintf(fp1, "u=\n");
+	for (int i = 0; i < N; i++)
+	{
+		for (int j = 0; j < pcn + 1; j++)
+		{
+			fprintf(fp1, "%12.3f ", (float)LLR[i][j]);
+		}
+		fprintf(fp1, "\n");
+	}
+	fclose(fp1);
+	*/
+
+
+	//start decoder
+	for (itr = 1; itr <= iteration; itr++)
+	{
+		switch (decoder_algorithm)
+		{
+		case 0:
+			xor0 = 1;
+			for (int lev = 1; lev <= pcn; lev++)
+			{
+				st = (int)pow(2, xor0);
+				for (int i = 0; i <= N - 1; i++)
+				{
+					if ((i%st) < (st / 2))
+					{
+						R1 = LLRR[i][lev - 1];
+						R2 = LLRR[i + (st / 2)][lev - 1];
+						L1 = LLR[i][lev];
+						L2 = LLR[i + (st / 2)][lev];
+						LR2 = L2 + R2;
+
+						domain1 = fun(L1, LR2);
+						domain2 = fun(L1, R1);
+						domain3 = fun(R1, LR2);
+
+						LLR[i][lev - 1] = domain1;
+						LLR[i + (st / 2)][lev - 1] = L2 + domain2;
+						LLRR[i][lev] = domain3;
+						LLRR[i + (st / 2)][lev] = R2 + domain2;
+					}
+				}
+				xor0++;
+			}
+			break;
+		case 1:
+			switch (SBP_stop)
+			{
+				case 3:  //SS
+				{
+					
+					if (itr > 1)
+					{
+						xor0 = 1;
+						for (int lev = 1; lev <= pcn; lev++)
+						{
+							count = 0;
+							st = int(pow(2, xor0));
+							if (column[0] == 1)
+								break;
+							if (column[0] == 0 || column[1] == 0 || column[2] == 0 || column[3] == 0 || column[4] == 0 || column[5] == 0 || column[6] == 0 || column[7] == 0 || column[8] == 0 || column[9] == 0 || column[10] == 0)
+							{
+								for (int i = 0; i <= N - 1; i++)
+								{
+									u_sum = LLR[i][lev - 1] + LLRR[i][lev - 1];
+									if (fabs(u_sum) >= PSthre)
+									{
+										count++;
+									}
+									if (i == N - 1 && count >= N)
+										column[lev - 1] = 1;
+
+
+									if (lev == pcn)
+									{
+										count1 = 0;
+
+										u_sum1 = LLRR[i + (st / 2)][lev - 1] + LLR[i + (st / 2)][lev]; //R2+L2
+										if (fabs(u_sum1) >= PSthre)
+										{
+											count1++;
+										}
+										if (i == N - 1 && count1 >= N)
+											column[lev] = 1;
+									}
+								}
+							}
+						}
+						xor0++;
+					}
+					if (column[0] == 1)
+					{
+						printf("iteration = %d\n", itr);
+						itr_snr[0] = itr_snr[0] + itr;
+						return;
+					}
+					else if (column[0] == 0 || column[1] == 0 || column[2] == 0 || column[3] == 0 || column[4] == 0 || column[5] == 0 || column[6] == 0 || column[7] == 0 || column[8] == 0 || column[9] == 0 || column[10] == 0)
+					{
+						xor0 = 1;
+						//R
+						for (int lev = 1; lev <= pcn; lev++)
+						{
+							st = int(pow(2, xor0));
+							if (column[lev] == 0)  //non-convergence
+							{
+								for (int i = 0; i <= N - 1; i++)
+								{
+
+									if ((i%st) < (st / 2))
+									{
+										R1 = LLRR[i][lev - 1];
+										R2 = LLRR[i + (st / 2)][lev - 1];
+										L1 = LLR[i][lev];
+										L2 = LLR[i + (st / 2)][lev];
+										LR2 = L2 + R2;
+
+										domain2 = fun(L1, R1);
+										domain3 = fun(R1, LR2);
+
+										//LLR[i][lev - 1] = domain1;
+										//LLR[i + (st / 2)][lev - 1] = L2 + domain2;
+										LLRR[i][lev] = domain3;
+										LLRR[i + (st / 2)][lev] = R2 + domain2;
+									}
+								}
+							}
+							else 
+							{
+								if (lev == 1)LS1[0]++;
+								else if(lev == 2)LS2[0]++;
+								else if (lev == 3)LS3[0]++;
+								else if (lev == 4)LS4[0]++;
+								else if (lev == 5)LS5[0]++;
+								else if (lev == 6)LS6[0]++;
+								else if (lev == 7)LS7[0]++;
+								else if (lev == 8)LS8[0]++;
+								else if (lev == 9)LS9[0]++;
+								else LS10[0]++;
+							}
+							xor0++;
+						}
+						if (column[0] == 1)
+						{
+							LS0[0]++;
+						}
+						xor0 = pcn;
+						//L
+						for (int lev = pcn; lev >= 1; lev--)
+						{
+							st = int(pow(2, xor0));
+							if (column[lev-1] == 0)  //non-convergence
+							{
+								for (int i = 0; i <= N - 1; i++)
+								{
+
+									if ((i%st) < (st / 2))
+									{
+										R1 = LLRR[i][lev - 1];
+										R2 = LLRR[i + (st / 2)][lev - 1];
+										L1 = LLR[i][lev];
+										L2 = LLR[i + (st / 2)][lev];
+										LR2 = L2 + R2;
+
+										domain1 = fun(L1, LR2);
+										domain2 = fun(L1, R1);
+
+										LLR[i][lev - 1] = domain1;
+										LLR[i + (st / 2)][lev - 1] = L2 + domain2;
+									}
+								}
+							}
+							else
+							{
+								if (lev == 1)LS1[0]++;
+								else if (lev == 2)LS2[0]++;
+								else if (lev == 3)LS3[0]++;
+								else if (lev == 4)LS4[0]++;
+								else if (lev == 5)LS5[0]++;
+								else if (lev == 6)LS6[0]++;
+								else if (lev == 7)LS7[0]++;
+								else if (lev == 8)LS8[0]++;
+								else if (lev == 9)LS9[0]++;
+								else LS0[0]++;
+							}
+							xor0--;
+						}
+						if (column[10] == 1)
+						{
+							LS10[0]++;
+						}
+
+					}
+					break;
+				}
+				default: //original round-trip
+				{
+					xor0 = 1;
+					for (int lev = 1; lev <= pcn; lev++)
+					{
+						st = (int)pow(2, xor0);
+						for (int i = 0; i <= N - 1; i++)
+						{
+							if ((i%st) < (st / 2))
+							{
+								R1 = LLRR[i][lev - 1];
+								R2 = LLRR[i + (st / 2)][lev - 1];
+								L1 = LLR[i][lev];
+								L2 = LLR[i + (st / 2)][lev];
+								LR2 = L2 + R2;
+
+								domain2 = fun(L1, R1);
+								domain3 = fun(R1, LR2);
+
+								LLRR[i][lev] = domain3;
+								LLRR[i + (st / 2)][lev] = R2 + domain2;
+
+								if (direction == 1)
+								{
+									domain1 = fun(L1, LR2);
+									LLR[i][lev - 1] = domain1;
+									LLR[i + (st / 2)][lev - 1] = L2 + domain2;
+								}
+							}
+						}
+						xor0++;
+					}
+					xor0 = pcn;
+					for (int lev = pcn; lev >= 1; lev--)
+					{
+						st = (int)pow(2, xor0);
+
+						for (int i = 0; i <= N - 1; i++)
+						{
+							if ((i%st) < (st / 2))
+							{
+								R1 = LLRR[i][lev - 1];
+								R2 = LLRR[i + (st / 2)][lev - 1];
+								L1 = LLR[i][lev];
+								L2 = LLR[i + (st / 2)][lev];
+								LR2 = L2 + R2;
+
+								domain1 = fun(L1, LR2);
+								domain2 = fun(L1, R1);
+
+								LLR[i][lev - 1] = domain1;
+								LLR[i + (st / 2)][lev - 1] = L2 + domain2;
+
+								if (direction == 1)
+								{
+									domain3 = fun(R1, LR2);
+									LLRR[i][lev] = domain3;
+									LLRR[i + (st / 2)][lev] = R2 + domain2;
+								}
+							}
+						}
+						xor0--;
+					}
+					break;
+				}
+			}
+			break;
+		}
+		
+
+		for (int i = 0; i <= N - 1; i++) {
+			u_out[i] = LLR[i][0] + LLRR[i][0];
+			x_out[i] = LLRR[i][pcn] + LLR[i][pcn];
+		}
+
+		//hard decision
+		for (int i = 0; i <= N - 1; i++) {
+			if (u_out[i] >= 0)
+				u_out_hd[i] = 0;
+			else
+				u_out_hd[i] = 1;
+
+			if (x_out[i] >= 0)
+				x_out_hd[i] = 0;
+			else
+				x_out_hd[i] = 1;
+		}
+
+		switch (decoder_algorithm)
+		{
+		case 0:
+			if (itr >= pcn) 
+			{
+				if (bpstop(u_out, u_out_hd, x_out_hd) == true) 
+				{
+					printf("iteration = %d\n", itr);
+					itr_snr[0] = itr_snr[0] + itr;
+					return;
+				}
+			}
+			break;
+		case 1:
+			if (bpstop(u_out, u_out_hd, x_out_hd) == true) 
+			{
+				printf("iteration = %d\n", itr);
+				itr_snr[0] = itr_snr[0] + itr;
+				return;
+			}
+			break;
+		}
+
+		if (itr == iteration)
+			itr_snr[0] = itr_snr[0] + itr;
+
+		/*看輸出
+		FILE *fp2;
+		sprintf_s(file_name, "itr%d_R.txt", itr);
+		fopen_s(&fp2, file_name, "w");
+		fprintf(fp2, "u=\n");
+		for (int i = 0; i < N; i++)
+		{
+			for (int j = 0; j < pcn + 1; j++)
+			{
+				fprintf(fp2, "%12.3f ", (float)LLRR[i][j]);
+			}
+			fprintf(fp2, "\n");
+		}
+		fclose(fp2);
+		FILE *fp1;
+		sprintf_s(file_name, "itr%d_L.txt", itr);
+		fopen_s(&fp1, file_name, "w");
+		fprintf(fp1, "u=\n");
+		for (int i = 0; i < N; i++)
+		{
+			for (int j = 0; j < pcn + 1; j++)
+			{
+				fprintf(fp1, "%12.3f ", (float)LLR[i][j]);
+			}
+			fprintf(fp1, "\n");
+		}
+		fclose(fp1);
+		*/
+	}
+}
+bool bpstop(long double u_out[], int u_out_hd[], int x_out_hd[])
+{
+	int base, count, b, nb;
+	long double minLLR;
+	int u_temp_hd[N];
+	for (int i = 0; i < N; i++)
+		u_temp_hd[i] = u_out_hd[i];
+
+	long double u_temp[N];
+	for (int i = 0; i < N; i++)
+		u_temp[i] = u_out[i];
+
+	switch (SBP_stop) 
+	{
+		case 0:	//G-martix
+		{
+			for (int i = 1; i <= pcn; i++)
+			{
+				b = (int)pow(2, pcn - i + 1);
+				nb = (int)pow(2, i - 1);
+				for (int j = 1; j <= nb; j++)
+				{
+					base = (j - 1)*b;
+					for (int l = 0; l <= (b / 2) - 1; l++)
+					{
+						count = (u_temp_hd[base + l] + u_temp_hd[base + b / 2 + l]);
+						u_temp_hd[base + l] = (count % 2);
+					}
+				}
+			}
+			for (int i = 0; i <= N - 1; i++)
+				if (u_temp_hd[i] != x_out_hd[i])
+					return false;
+			return true;
+		}
+		case 1:	//MinLLR
+		{
+			minLLR = fabs(u_temp[0]);
+			for (int i = 1; i <= N - 1; i++)
+				if (fabs(u_temp[i]) <= minLLR)
+					minLLR = fabs(u_temp[i]);
+			if (minLLR >= beta)
+				return true;
+			return false;
+		}
+		case 2: //non stopping
+			return false;
+	}
+	return false;
+}
+long double fun(long double x, long double y)
+{
+	long double up, down;
+	int sgn = 1;
+	int sgn1, sgn2;
+	long double minimun;
+
+	if (x < 0) {
+		sgn1 = -sgn;
+	}
+	else {
+		sgn1 = sgn;
+	}
+	if (y < 0) {
+		sgn2 = -sgn;
+	}
+	else {
+		sgn2 = sgn;
+	}
+	if (fabsl(x) != fabsl(y)) {
+		if (fabsl(x) > fabsl(y)) {
+			minimun = fabsl(y);
+		}
+		else {
+			minimun = fabsl(x);
+		}
+	}
+	else {
+		minimun = fabsl(x);
+	}
+	if (origin_BP == 1) {
+		up = 1 + exp(x)*exp(y);
+		down = exp(x) + exp(y);
+		return log(up / down);
+	}
+	else {
+		return sgn1 * sgn2*minimun *0.9375;
+	}
+
+}
